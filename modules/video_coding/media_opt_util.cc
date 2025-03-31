@@ -117,7 +117,7 @@ bool VCMNackFecMethod::ProtectionFactor(
   // Compute the protection factors
   VCMFecMethod::ProtectionFactor(parameters);
   if (_lowRttNackMs == -1 || parameters->rtt < _lowRttNackMs) {
-    _protectionFactorD = 0;
+    _protectionFactorD = 0;// 低RTT时只使用NACK，禁用FEC
     VCMFecMethod::UpdateProtectionFactorD(_protectionFactorD);
 
     // When in Hybrid mode (RTT range), adjust FEC rates based on the
@@ -125,6 +125,7 @@ bool VCMNackFecMethod::ProtectionFactor(
   } else if (_highRttNackMs == -1 || parameters->rtt < _highRttNackMs) {
     // TODO(mikhal): Disabling adjustment temporarily.
     // uint16_t rttIndex = (uint16_t) parameters->rtt;
+    // 中等RTT时，结合NACK和FEC，可能调整FEC率
     float adjustRtt = 1.0f;  // (float)VCMNackFecTable[rttIndex] / 100.0f;
 
     // Adjust FEC with NACK on (for delta frame only)
@@ -170,7 +171,7 @@ int VCMNackFecMethod::MaxFramesFec() const {
 }
 
 bool VCMNackFecMethod::BitRateTooLowForFec(
-    const VCMProtectionParameters* parameters) {
+    const VCMProtectionParameters* parameters) { // 码率过低时，禁用FEC
   // Bitrate below which we turn off FEC, regardless of reported packet loss.
   // The condition should depend on resolution and content. For now, use
   // threshold on bytes per frame, with some effect for the frame size.
@@ -311,20 +312,20 @@ bool VCMFecMethod::ProtectionFactor(const VCMProtectionParameters* parameters) {
   uint8_t lossThr = 0;
   uint8_t packetNumThr = 1;
 
-  // Parameters for range of rate index of table.
+  // Parameters for range of rate index of table. ratePar1=5和ratePar2=49是定义速率索引范围的参数
   const uint8_t ratePar1 = 5;
   const uint8_t ratePar2 = 49;
 
-  // Spatial resolution size, relative to a reference size.
+// 视频分辨率相对于参考分辨率(704x576)的比例 空间分辨率调整因子
   float spatialSizeToRef = rtc::saturated_cast<float>(parameters->codecWidth *
                                                       parameters->codecHeight) /
                            (rtc::saturated_cast<float>(704 * 576));
   // resolnFac: This parameter will generally increase/decrease the FEC rate
   // (for fixed bitRate and packetLoss) based on system size.
   // Use a smaller exponent (< 1) to control/soften system size effect.
-  const float resolnFac = 1.0 / powf(spatialSizeToRef, 0.3f);
+  const float resolnFac = 1.0 / powf(spatialSizeToRef, 0.3f);// 分辨率因子：分辨率越高，保护率越低
 
-  const int bitRatePerFrame = BitsPerFrame(parameters);
+  const int bitRatePerFrame = BitsPerFrame(parameters);// 计算每帧的比特率，这里用帧率计算来着,还用了时间层数（svc编码）
 
   // Average number of packets per frame (source and fec):
   const uint8_t avgTotPackets = rtc::saturated_cast<uint8_t>(
@@ -337,15 +338,16 @@ bool VCMFecMethod::ProtectionFactor(const VCMProtectionParameters* parameters) {
 
   // Get index for table: the FEC protection depends on an effective rate.
   // The range on the rate index corresponds to rates (bps)
-  // from ~200k to ~8000k, for 30fps
+  // from ~200k to ~8000k, for 30fps  计算有效比特率
   const uint16_t effRateFecTable =
-      rtc::saturated_cast<uint16_t>(resolnFac * bitRatePerFrame);
+      rtc::saturated_cast<uint16_t>(resolnFac * bitRatePerFrame);// 计算考虑分辨率影响后的有效比特率
+      // 为I帧(关键帧)计算表格索引并查询保护因子
   uint8_t rateIndexTable = rtc::saturated_cast<uint8_t>(
       VCM_MAX(VCM_MIN((effRateFecTable - ratePar1) / ratePar1, ratePar2), 0));
 
   // Restrict packet loss range to 50:
   // current tables defined only up to 50%
-  if (packetLoss >= kPacketLossMax) {
+  if (packetLoss >= kPacketLossMax) {// 限制丢包率范围,现有查表最大值为50%
     packetLoss = kPacketLossMax - 1;
   }
   uint16_t indexTable = rateIndexTable * kPacketLossMax + packetLoss;
@@ -356,7 +358,7 @@ bool VCMFecMethod::ProtectionFactor(const VCMProtectionParameters* parameters) {
   // Protection factor for P frame
   codeRateDelta = kFecRateTable[indexTable];
 
-  if (packetLoss > lossThr && avgTotPackets > packetNumThr) {
+  if (packetLoss > lossThr && avgTotPackets > packetNumThr) {//判断是否需要最小保护
     // Set a minimum based on first partition size.
     if (codeRateDelta < firstPartitionProt) {
       codeRateDelta = firstPartitionProt;
@@ -372,12 +374,13 @@ bool VCMFecMethod::ProtectionFactor(const VCMProtectionParameters* parameters) {
   // Effectively at a higher rate, so we scale/boost the rate
   // The boost factor may depend on several factors: ratio of packet
   // number of I to P frames, how much protection placed on P frames, etc.
+  // 计算关键帧保护增强系数
   const uint8_t packetFrameDelta =
       rtc::saturated_cast<uint8_t>(0.5 + parameters->packetsPerFrame);
   const uint8_t packetFrameKey =
       rtc::saturated_cast<uint8_t>(0.5 + parameters->packetsPerFrameKey);
   const uint8_t boostKey = BoostCodeRateKey(packetFrameDelta, packetFrameKey);
-
+// 为I帧(关键帧)计算表格索引并查询保护因子
   rateIndexTable = rtc::saturated_cast<uint8_t>(VCM_MAX(
       VCM_MIN(1 + (boostKey * effRateFecTable - ratePar1) / ratePar1, ratePar2),
       0));
@@ -401,12 +404,12 @@ bool VCMFecMethod::ProtectionFactor(const VCMProtectionParameters* parameters) {
   // and at least as high as filtered packet loss.
   codeRateKey = rtc::saturated_cast<uint8_t>(
       VCM_MAX(packetLoss, VCM_MAX(boostKeyProt, codeRateKey)));
-
+// 确保关键帧保护至少大于P帧保护和丢包率
   // Check limit on amount of protection for I frame: 50% is max.
   if (codeRateKey >= kPacketLossMax) {
     codeRateKey = kPacketLossMax - 1;
   }
-
+// 将保护因子从"相对于总包数"转换为"相对于源包数"
   _protectionFactorK = codeRateKey;
   _protectionFactorD = codeRateDelta;
 
@@ -444,14 +447,14 @@ bool VCMFecMethod::ProtectionFactor(const VCMProtectionParameters* parameters) {
 
 int VCMFecMethod::BitsPerFrame(const VCMProtectionParameters* parameters) {
   // When temporal layers are available FEC will only be applied on the base
-  // layer.
+  // layer.// 计算时间层影响下的比特率和帧率比例
   const float bitRateRatio =
       webrtc::SimulcastRateAllocator::GetTemporalRateAllocation(
           parameters->numLayers, 0,
           rate_control_settings_.Vp8BaseHeavyTl3RateAllocation());
   float frameRateRatio = powf(1 / 2.0, parameters->numLayers - 1);
   float bitRate = parameters->bitRate * bitRateRatio;
-  float frameRate = parameters->frameRate * frameRateRatio;
+  float frameRate = parameters->frameRate * frameRateRatio;//帧率越高，每帧分配的比特率越低，会降低FEC保护率
 
   // TODO(mikhal): Update factor following testing.
   float adjustmentFactor = 1;
